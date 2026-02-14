@@ -1,59 +1,39 @@
 #include <stdio.h>
 #include <string.h>
-#include <openssl/evp.h>
-#include <openssl/kdf.h>
-#include <gcrypt.h>
-#include <glib.h>
-#include <stdio.h>
-#include <pcap.h>
 #include <stdlib.h>
+#include <pcap.h>
 #include <arpa/inet.h>
 #include <netinet/ip.h>
-#include <netinet/ip6.h>
-#include <netinet/tcp.h>
 #include <netinet/udp.h>
 #include <netinet/if_ether.h>
-#include <sys/types.h>
-#include <sys/socket.h>
-#include <pthread.h>
-#include <time.h>
-#include <unistd.h> // Added for sleep function
-#include <stdio.h>
-#include <string.h>
-#include <openssl/evp.h>
-#include <openssl/kdf.h>
+#include <stdint.h>
 #include <ctype.h>
 #include "quic_d.h"
-#include <ctype.h>
-#include <string.h>
-#include <stdio.h>
-#include <stdint.h>
-
-uint32_t packet_counter = 0;
-Session_info *find_or_create_session(quic_cid_t quic_dcic, uint32_t quic_version)
-{
-    Session_info *new_session = (Session_info *)malloc(sizeof(Session_info));
-    if (!new_session) {
-        perror("malloc");
-        exit(EXIT_FAILURE);
-    }
-    memset(new_session, 0, sizeof(Session_info));
-    new_session->quic_version = quic_version;
-    new_session->quic_dcic.len = quic_dcic.len;
-    memcpy(new_session->quic_dcic.cid, quic_dcic.cid, quic_dcic.len);
-    return new_session;
-}
-
-#define MIN_PRINTABLE_SEQ \
-    5 // Minimum length of consecutive printable characters to consider as a string
-#define MAX_STR_SIZE 256 // Maximum string length to extract
 
 #define MIN_HOST_LEN 6
 #define MAX_HOST_LEN 253
+#define QUIC_PORT 443
+#define QUIC_LONG_HEADER_BIT 0x80
+#define QUIC_HEADER_FORM_MASK 0xC0
+#define ETHERNET_HEADER_SIZE 14
+#define UDP_HEADER_SIZE 8
 
+// Thread-local or atomic counter if multi-threading
+uint32_t packet_counter = 0;
+
+typedef struct packet_data_info {
+    uint16_t packet_header_length;
+    uint16_t packet_payload_length;
+    uint16_t packet_length;
+    unsigned char sni[256];
+    uint16_t dst_port;
+} packet_info_t;
+
+// Optimized: inline for better performance
 static inline int is_host_char(unsigned char c)
 {
-    return isalnum(c) || c == '.' || c == '-';
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.' ||
+           c == '-';
 }
 
 static int is_valid_hostname(const unsigned char *s, int len)
@@ -62,9 +42,11 @@ static int is_valid_hostname(const unsigned char *s, int len)
     int has_alpha = 0;
     int has_dot = 0;
 
+    // Early bounds check
     if (len < MIN_HOST_LEN || len > MAX_HOST_LEN)
         return 0;
 
+    // Check first and last characters
     if (s[0] == '.' || s[0] == '-' || s[len - 1] == '.' || s[len - 1] == '-')
         return 0;
 
@@ -74,7 +56,8 @@ static int is_valid_hostname(const unsigned char *s, int len)
         if (!is_host_char(c))
             return 0;
 
-        if (isalpha(c))
+        // Optimized: avoid redundant isalpha call
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'))
             has_alpha = 1;
 
         if (c == '.') {
@@ -106,8 +89,9 @@ int extract_hostnames(const unsigned char *buf, size_t len, unsigned char *out, 
         return 0;
 
     for (size_t i = 0; i < len; i++) {
-        /* possible hostname start */
-        if (isalpha(buf[i])) {
+        // Optimized: check for alpha character more efficiently
+        unsigned char c = buf[i];
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) {
             size_t j = i;
             while (j < len && is_host_char(buf[j]))
                 j++;
@@ -115,7 +99,7 @@ int extract_hostnames(const unsigned char *buf, size_t len, unsigned char *out, 
             int slen = j - i;
 
             if (is_valid_hostname(&buf[i], slen)) {
-                /* boundary check */
+                // Boundary check
                 if (j < len && isalnum(buf[j])) {
                     continue;
                 }
@@ -135,228 +119,184 @@ int extract_hostnames(const unsigned char *buf, size_t len, unsigned char *out, 
     return 0;
 }
 
+Session_info *find_or_create_session(quic_cid_t quic_dcic, uint32_t quic_version)
+{
+    Session_info *new_session = (Session_info *)malloc(sizeof(Session_info));
+    if (!new_session) {
+        perror("malloc");
+        return NULL;
+    }
+
+    memset(new_session, 0, sizeof(Session_info));
+    new_session->quic_version = quic_version;
+    new_session->quic_dcic.len = quic_dcic.len;
+    memcpy(new_session->quic_dcic.cid, quic_dcic.cid, quic_dcic.len);
+
+    return new_session;
+}
+
 void detect_quic(const u_char *packet, packet_info_t *packet_info)
 {
-    uint16_t offset = packet_info->packet_header_length;
-    if (offset + 8 > packet_info->packet_length)
+    // Early exit optimization
+    if (packet_info->dst_port != QUIC_PORT)
         return;
-    if (!(packet_info->dst_port == 443))
+
+    uint16_t offset = packet_info->packet_header_length;
+
+    // Bounds check optimization
+    if (offset + 8 > packet_info->packet_length)
         return;
 
     const u_char *quic_packet = packet + offset;
     uint16_t quic_packet_len = packet_info->packet_payload_length;
-    uint8_t quic_byte0 = quic_packet[0];
-    uint32_t *quic_version = (uint32_t *)&quic_packet[1];
-    uint32_t qv = htonl(*quic_version);
-    if (!((quic_byte0 & 0xF0) == 0xC0))
-        return;
-    //if (((quic_byte0&0xF0) == 0xc0 ||(quic_byte0&0xF0) == 0xd0||(quic_byte0&0xF0) == 0xe0||(quic_byte0&0xF0) == 0xf0 ) && (quic_version ==0x01)){}
 
-    //printf(" ======================== QUIC DETECTED ===================== %u\n",packet_counter );
-    //quic_info_data_t quic_info;
+    uint8_t quic_byte0 = quic_packet[0];
+
+    // Optimized: check long header format directly
+    if ((quic_byte0 & QUIC_HEADER_FORM_MASK) != 0xC0)
+        return;
+
+    // Extract CID length
+    uint8_t cid_len = quic_packet[5];
+    if (cid_len == 0 || cid_len > QUIC_MAX_CID_LENGTH)
+        return;
+
+    // Stack allocation for small CID - avoid malloc
     quic_cid_t cid_t;
-    cid_t.len = (uint8_t)quic_packet[5];
-    if (cid_t.len == 0)
+    cid_t.len = cid_len;
+    memcpy(cid_t.cid, &quic_packet[6], cid_len);
+
+    // Direct read and byte swap
+    uint32_t quic_version = ntohl(*(uint32_t *)&quic_packet[1]);
+
+    // Allocate session - consider using object pool for optimization
+    Session_info *Session_t = find_or_create_session(cid_t, quic_version);
+    if (!Session_t)
         return;
-    memcpy(cid_t.cid, &quic_packet[6], cid_t.len);
-    Session_info *Session_t = find_or_create_session(cid_t, qv);
-    //if (Session_t->packet_count==0)
-    //{
-    if (!decode_quic(Session_t))
+
+    if (!decode_quic(Session_t)) {
+        free(Session_t);
         return;
-    //}
-    //Session_t->packet_count++;
-    //print_secrete("DCIC",cid_t.cid,cid_t.len);
+    }
+
     quic_ciphers_t this_quic_ciphers_t = Session_t->quic_cipher_keys;
-    int quic_cidc_len = quic_packet[1 + 4 + 1 + cid_t.len];
-    int quic_cidc_offset = 1 + 4 + 1 + cid_t.len + 1;
+
+    // Calculate offsets
+    int quic_cidc_len = quic_packet[1 + 4 + 1 + cid_len];
+    int quic_cidc_offset = 1 + 4 + 1 + cid_len + 1;
     int token_len_offset = quic_cidc_offset + quic_cidc_len;
+
     uint64_t token_val;
     uint16_t token_bytes = GetVarInt(quic_packet, token_len_offset, &token_val);
     uint16_t token_len = (uint16_t)token_val;
-    //printf("token_bytes: %u   token_len = %u\n", token_bytes,token_len);
-    //int token_len = quic_packet[quic_cidc_offset +quic_cidc_len];
 
-    int token_offset = token_len_offset + token_bytes; //1+4+1+cid_t.len+1+cidc_len+1;
-    //int packet_len = quic_packet[token_offset +token_len];
+    int token_offset = token_len_offset + token_bytes;
     uint64_t qpkn_val;
     uint16_t qpkn_len_bytes = GetVarInt(quic_packet, token_offset + token_len, &qpkn_val);
     int quic_offset = token_offset + token_len + qpkn_len_bytes;
-    //printf("pkt_len_bytes: %u   packet_val = %lu\n", pkt_len_bytes,packet_val);
 
-    // printf("quic_offset = %d\n",quic_offset);
     quic_frame_essentials_t quic_frame_essens;
-    //uint16_t len_pkn,pkt_pkn;
-    //uint8_t qbyte0;
-    if (!process_quic_header(quic_packet, quic_offset, this_quic_ciphers_t, &quic_frame_essens))
-        return;
-    //printf("Packet Number: %lu  pkn_len = %u quic_byte0 %02x\n", quic_frame_essens.qpkn,quic_frame_essens.qpkn_len,quic_frame_essens.first_byte);
-    quic_offset += quic_frame_essens.qpkn_len;
-    uint8_t *associateddata = (uint8_t *)malloc(quic_offset);
-    memcpy(associateddata, quic_packet, quic_offset);
-    uint8_t *authtag = (uint8_t *)malloc(16);
-    memcpy(authtag, quic_packet + quic_packet_len - 16, 16);
-    // printf("authtag: ");
-    //for (int i = 0; i < 16; i++) {
-    //    printf("%02x", authtag[i]);
-    // }
-    // printf("\n");
 
-    // Extract and save bytes except header and last 16
-    int cipher_payload_len = quic_packet_len - quic_offset - 16;
-    uint8_t *cipher_payload = (uint8_t *)malloc(cipher_payload_len);
-    memcpy(cipher_payload, quic_packet + quic_offset, cipher_payload_len);
-    uint8_t *decrypted_payload;
-
-    decrypted_payload = (uint8_t *)malloc(cipher_payload_len);
-    if (!decrypted_payload) {
-        fprintf(stderr, "Memory allocation failed for decrypted_payload\n");
+    if (!process_quic_header(quic_packet, quic_offset, this_quic_ciphers_t, &quic_frame_essens)) {
+        free(Session_t);
         return;
     }
-    //printf("\n");
+
+    quic_offset += quic_frame_essens.qpkn_len;
+
+    // Calculate sizes
+    int cipher_payload_len = quic_packet_len - quic_offset - 16;
+
+    // Bounds check
+    if (cipher_payload_len <= 0) {
+        free(Session_t);
+        return;
+    }
+
+    // Allocate all buffers at once to reduce allocator overhead
+    size_t total_size = quic_offset + 16 + cipher_payload_len * 2;
+    uint8_t *buffer = (uint8_t *)malloc(total_size);
+    if (!buffer) {
+        fprintf(stderr, "Memory allocation failed\n");
+        free(Session_t);
+        return;
+    }
+
+    // Partition the buffer
+    uint8_t *associateddata = buffer;
+    uint8_t *authtag = buffer + quic_offset;
+    uint8_t *cipher_payload = buffer + quic_offset + 16;
+    uint8_t *decrypted_payload = buffer + quic_offset + 16 + cipher_payload_len;
+
+    // Copy data
+    memcpy(associateddata, quic_packet, quic_offset);
+    memcpy(authtag, quic_packet + quic_packet_len - 16, 16);
+    memcpy(cipher_payload, quic_packet + quic_offset, cipher_payload_len);
+
     int ret = process_quic_payload(associateddata, quic_offset, authtag, cipher_payload,
                                    cipher_payload_len, quic_frame_essens, this_quic_ciphers_t,
                                    decrypted_payload);
     if (ret) {
-        int p = 0;
-
         int hlen = extract_hostnames(decrypted_payload, cipher_payload_len, packet_info->sni, 256);
         if (hlen) {
-            printf("packet_counter   = %u\t ", packet_counter);
-            printf("Readable output:\t%s\n", packet_info->sni);
+            printf("packet_counter   = %u\t Readable output:\t%s\n", packet_counter,
+                   packet_info->sni);
         }
-        //free(readable);
-        /*if (packet_counter==54004 || packet_counter==54003 ){
-         for (p =0; p< cipher_payload_len ;p++)
-         {
-            // printf()
-             char c = (char)decrypted_payload[p];
-            if (isprint(c))
-             printf("%c",c);
-
-
-        }
-	}*/
-        // memcpy(Session_t->quic_decrypted_frames[Session_t->quic_decrypted_frames_count], decrypted_payload, cipher_payload_len);
-        //Session_t->quic_decrypted_frame_len[Session_t->quic_decrypted_frames_count] = cipher_payload_len;
-        //printf("cipher_payload_len = %u  %u\n",cipher_payload_len, Session_t->quic_decrypted_frame_len[Session_t->quic_decrypted_frames_count]);
-        //Session_t->session_decrypted_payload_length +=cipher_payload_len;
-        //Session_t->quic_decrypted_frames_count++;
     }
-    free(Session_t);
-    free(decrypted_payload);
-    free(cipher_payload);
-    free(associateddata);
-    free(authtag);
-    //if (packet_counter==24)
-    //	printf("session->session_is_quic  Hameed\n");
-    //session = find_or_create_session(src_ip, dst_ip, src_port, dst_port,0);
-    //if (session->session_is_quic == 4)
-    //session->session_is_quic++;
-    //if (packet_counter==24)
-    //printf("session->session_is_quic  %u\n",session->session_is_quic);
 
-    /*if (src_port != 0 && dst_port != 0) {
-        Session *session = find_or_create_session(src_ip, dst_ip, src_port, dst_port, protocol);
-        session->packet_count++;
-        session->byte_count += header->len;
-        session->last_packet_time = time(NULL);
-    }*/
+    // Single free instead of multiple
+    free(buffer);
+    free(Session_t);
 }
 
-// Function to process each packet
 void packet_handler(u_char *args, const struct pcap_pkthdr *header, const u_char *packet)
 {
+    (void)args;
+
+    packet_counter++;
+
     const struct ether_header *eth_header = (struct ether_header *)packet;
     uint16_t eth_type = ntohs(eth_header->ether_type);
-    //uint16_t packet_caplen = header->caplen;
-    char src_ip[INET6_ADDRSTRLEN] = { 0 };
-    char dst_ip[INET6_ADDRSTRLEN] = { 0 };
-    uint16_t src_port = 0;
-    uint16_t dst_port = 0;
-    uint8_t protocol = 0;
-    const u_char *payload;
+
+    // Early exit if not IPv4
+    if (eth_type != ETHERTYPE_IP)
+        return;
+
+    const struct ip *ip_header = (struct ip *)(packet + ETHERNET_HEADER_SIZE);
+
+    // Early exit if not UDP
+    if (ip_header->ip_p != IPPROTO_UDP)
+        return;
+
+    int ip_header_len = ip_header->ip_hl * 4;
+    int offset = ETHERNET_HEADER_SIZE + ip_header_len + UDP_HEADER_SIZE;
+
+    const struct udphdr *udp_header = (struct udphdr *)((u_char *)ip_header + ip_header_len);
+
     packet_info_t packet_info;
+    packet_info.dst_port = ntohs(udp_header->dest);
+    packet_info.packet_header_length = offset;
     packet_info.packet_length = header->caplen;
-    int offset = 14;
-    packet_counter++;
-    //packet_info.packet_counter = packet_counter;
-    //if (packet_counter > 500)
-    //return;
-    if (eth_type == ETHERTYPE_IP) {
-        const struct ip *ip_header = (struct ip *)(packet + sizeof(struct ether_header));
-        protocol = ip_header->ip_p;
-        //inet_ntop(AF_INET, &(ip_header->ip_src), packet_info.src_ip, INET_ADDRSTRLEN);
-        //inet_ntop(AF_INET, &(ip_header->ip_dst), packet_info.dst_ip, INET_ADDRSTRLEN);
-        //packet_info.ip_packet_type = 4;
-        offset += ip_header->ip_hl * 4;
-        if (protocol == IPPROTO_TCP) {
-            const struct tcphdr *tcp_header =
-                    (struct tcphdr *)((u_char *)ip_header + (ip_header->ip_hl * 4));
-            //packet_info.src_port = ntohs(tcp_header->source);
-            packet_info.dst_port = ntohs(tcp_header->dest);
-            //packet_info.l4_proto = IPPROTO_TCP;
-            return;
+    packet_info.packet_payload_length = header->caplen - offset;
 
-        } else if (protocol == IPPROTO_UDP) {
-            const struct udphdr *udp_header =
-                    (struct udphdr *)((u_char *)ip_header + (ip_header->ip_hl * 4));
-            //packet_info.src_port = ntohs(udp_header->source);
-            packet_info.dst_port = ntohs(udp_header->dest);
-            //packet_info.l4_proto = IPPROTO_UDP;
-            offset += 8;
-            packet_info.packet_header_length = offset;
-            packet_info.packet_payload_length = header->caplen - offset;
-            detect_quic(packet, &packet_info);
-        }
-
-    } else if (eth_type == ETHERTYPE_IPV6) {
-        const struct ip6_hdr *ip6_header = (struct ip6_hdr *)(packet + sizeof(struct ether_header));
-        protocol = ip6_header->ip6_nxt;
-        //inet_ntop(AF_INET6, &(ip6_header->ip6_src), packet_info.src_ip, INET6_ADDRSTRLEN);
-        //inet_ntop(AF_INET6, &(ip6_header->ip6_dst), packet_info.dst_ip, INET6_ADDRSTRLEN);
-        //packet_info.ip_packet_type = 6;
-        offset += sizeof(struct ip6_hdr);
-        if (protocol == IPPROTO_TCP) {
-            const struct tcphdr *tcp_header =
-                    (struct tcphdr *)((u_char *)ip6_header + sizeof(struct ip6_hdr));
-            // packet_info.src_port = ntohs(tcp_header->source);
-            packet_info.dst_port = ntohs(tcp_header->dest);
-            return;
-        } else if (protocol == IPPROTO_UDP) {
-            const struct udphdr *udp_header =
-                    (struct udphdr *)((u_char *)ip6_header + sizeof(struct ip6_hdr));
-            //packet_info.src_port = ntohs(udp_header->source);
-            packet_info.dst_port = ntohs(udp_header->dest);
-            // packet_info.l4_proto = IPPROTO_UDP;
-            offset += 8;
-            packet_info.packet_header_length = offset;
-            packet_info.packet_payload_length = header->caplen - offset;
-            detect_quic(packet, &packet_info);
-        }
-    }
+    detect_quic(packet, &packet_info);
 }
+
 int main(int argc, char *argv[])
 {
     if (argc != 2) {
-        fprintf(stderr, "Usage: %s <interface>\n", argv[0]);
+        fprintf(stderr, "Usage: %s <pcap_file>\n", argv[0]);
         return EXIT_FAILURE;
     }
 
     char *dev = argv[1];
     char errbuf[PCAP_ERRBUF_SIZE];
-    //pcap_t *handle = pcap_open_live(dev, BUFSIZ, 1, 1000, errbuf);
+
     pcap_t *handle = pcap_open_offline(dev, errbuf);
     if (!handle) {
-        fprintf(stderr, "Could not open device %s: %s\n", dev, errbuf);
+        fprintf(stderr, "Could not open file %s: %s\n", dev, errbuf);
         return EXIT_FAILURE;
     }
-
-    //pthread_t cleanup_thread;
-    //if (pthread_create(&cleanup_thread, NULL, session_cleanup_thread, NULL) != 0) {
-    //   perror("pthread_create");
-    //  return EXIT_FAILURE;
-    //}
 
     if (pcap_loop(handle, 0, packet_handler, NULL) < 0) {
         fprintf(stderr, "pcap_loop error: %s\n", pcap_geterr(handle));
@@ -365,12 +305,6 @@ int main(int argc, char *argv[])
     }
 
     pcap_close(handle);
-    //printf("PROCESSING SESSIONS\n");
-    //process_sessions();
-    //printf("quic_packet_count = %u\n",quic_packet_count);
-    //pthread_cancel(cleanup_thread);
-    //pthread_join(cleanup_thread, NULL);
-    return EXIT_SUCCESS;
 
-    return 0;
+    return EXIT_SUCCESS;
 }

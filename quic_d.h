@@ -1,4 +1,3 @@
-
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -6,18 +5,12 @@ typedef struct _StringInfo {
     unsigned char *data; /* Backing storage which may be larger than data_len */
     unsigned data_len; /* Length of the meaningful part of data */
 } StringInfo;
-#define TLS13_AEAD_NONCE_LENGTH 12
-#define QUIC_MAX_CID_LENGTH 20
-#define HASH_SHA2_256_LENGTH 32
 
+#define QUIC_MAX_CID_LENGTH 20
 typedef struct quic_cid {
     uint8_t len;
     uint8_t cid[QUIC_MAX_CID_LENGTH];
 } quic_cid_t;
-
-#define KEY_LEN 16 // 16 bytes for AES-128
-#define IV_LEN 12 // 12 bytes for IV
-int GetVarInt(const uint8_t *buffer, int offset, uint64_t *value);
 
 typedef struct quic_frame_essentials {
     uint16_t qpkn_len;
@@ -25,6 +18,9 @@ typedef struct quic_frame_essentials {
     uint8_t first_byte;
 } quic_frame_essentials_t;
 
+#define HASH_SHA2_256_LENGTH 32
+#define KEY_LEN 16 // 16 bytes for AES-128
+#define IV_LEN 12 // 12 bytes for IV
 typedef struct quic_ciphers_h {
     uint8_t client_initial_secret[HASH_SHA2_256_LENGTH];
     uint8_t client_initial_secret_len;
@@ -35,21 +31,13 @@ typedef struct quic_ciphers_h {
     unsigned char client_pp_key[KEY_LEN];
 } quic_ciphers_t;
 
-typedef struct packet_data_info {
-    //uint32_t packet_counter;
-    uint16_t packet_header_length;
-    uint16_t packet_payload_length;
-    uint16_t packet_length;
-    unsigned char sni[256];
-    uint16_t dst_port;
-} packet_info_t;
 typedef struct Session {
     uint32_t quic_version;
     quic_cid_t quic_dcic;
     quic_ciphers_t quic_cipher_keys;
-    //struct Session *next;
 } Session_info;
 
+int GetVarInt(const uint8_t *buffer, int offset, uint64_t *value);
 bool decode_quic(Session_info *Session_t);
 int process_quic_header(const unsigned char *quic_packet, int quic_offset,
                         quic_ciphers_t this_quic_ciphers_t,

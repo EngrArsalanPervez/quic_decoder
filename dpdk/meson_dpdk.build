@@ -1,0 +1,39 @@
+# SPDX-License-Identifier: BSD-3-Clause
+# DPDK QUIC Decryption Application
+
+project('quic_decrypt_dpdk', 'c',
+    version: '1.0',
+    default_options: ['buildtype=release', 'c_std=gnu11'],
+    license: 'BSD'
+)
+
+# DPDK dependency
+dpdk_dep = dependency('libdpdk', required: true)
+
+# Other dependencies
+glib_dep = dependency('glib-2.0', required: true)
+gcrypt_dep = dependency('libgcrypt', required: true)
+ssl_dep = dependency('openssl', required: true)
+crypto_dep = dependency('libcrypto', required: true)
+
+# Compiler flags
+add_project_arguments('-DALLOW_EXPERIMENTAL_API', language: 'c')
+add_project_arguments('-march=native', language: 'c')
+add_project_arguments('-Wno-unused-parameter', language: 'c')
+
+# Source files
+sources = files(
+    'main_dpdk.c',
+    'quic_d_optimized.c'
+)
+
+# Executable
+executable('quic_decrypt_dpdk',
+    sources,
+    dependencies: [dpdk_dep, glib_dep, gcrypt_dep, ssl_dep, crypto_dep],
+    install: true
+)
+
+# Print configuration
+message('DPDK version: ' + dpdk_dep.version())
+message('Build type: ' + get_option('buildtype'))

@@ -1,0 +1,53 @@
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright(c) 2024
+
+# DPDK QUIC Decryption Application Makefile
+
+ifeq ($(RTE_SDK),)
+$(error "Please define RTE_SDK environment variable")
+endif
+
+# Default target on install
+RTE_TARGET ?= x86_64-native-linuxapp-gcc
+
+include $(RTE_SDK)/mk/rte.vars.mk
+
+# Binary name
+APP = quic_decrypt_dpdk
+
+# Source files
+SRCS-y := main_dpdk.c quic_d_optimized.c
+
+# Build using pkg-config variables if possible
+ifneq ($(shell pkg-config --exists libdpdk && echo 0),0)
+$(error "pkg-config: libdpdk not found")
+endif
+
+PC_FILE := $(shell pkg-config --path libdpdk 2>/dev/null)
+CFLAGS += -O3 $(shell pkg-config --cflags libdpdk)
+LDFLAGS += $(shell pkg-config --libs libdpdk)
+
+# Additional CFLAGS
+CFLAGS += -I. -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include
+CFLAGS += -Wall -Wextra -Werror
+CFLAGS += -DALLOW_EXPERIMENTAL_API
+
+# Additional libraries
+LDFLAGS += -lgcrypt -lglib-2.0 -lssl -lcrypto
+
+# For older DPDK versions using traditional build system
+ifeq ($(wildcard $(RTE_SDK)/mk/rte.extapp.mk),)
+    # Use meson/pkg-config based build
+    build/$(APP): $(SRCS-y) quic_d.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ $(SRCS-y) $(LDFLAGS)
+
+.PHONY: all clean
+all: build/$(APP)
+
+clean:
+	rm -rf build
+else
+    # Use traditional DPDK build system
+    include $(RTE_SDK)/mk/rte.extapp.mk
+endif
